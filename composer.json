@@ -1,5 +1,5 @@
 {
-  "name": "reymark/route",
+  "name": "reymark/mrouter",
   "description": "A lightweight and flexible PHP routing library for building clean and maintainable web applications.",
   "type": "library",
   "license": "MIT",
