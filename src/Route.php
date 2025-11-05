@@ -1,28 +1,41 @@
 <?php
 namespace Route;
 
-use Blad\Blad as View;
-use Route\RouteHelper;
 use Exception;
+use Route\RouteHelper;
 
 class Route
 {
-    protected static array $routes             = [];
-    protected static array $routeMiddleware    = []; 
-    protected static array $middlewareRegistry = [];
-    protected static array $namedRoutes        = [];
-    protected static $notFound                 = null;
+    /** @var array<string, array> Registered routes */
+    protected static array $routes = [];
 
-    protected static string $groupPrefix    = '';
+    /** @var array<string, array> Route-specific middlewares */
+    protected static array $routeMiddleware = [];
+
+    /** @var array<string, callable|string> Middleware registry */
+    protected static array $middlewareRegistry = [];
+
+    /** @var callable|null Custom 404 handler */
+    protected static $notFound = null;
+
+    /** @var string Current group prefix */
+    protected static string $groupPrefix = '';
+
+    /** @var array Current group middlewares */
     protected static array $groupMiddleware = [];
 
-    // ----------------------------------------
-    // Route Definitions
-    // ----------------------------------------
-    public static function uri(string $uri, array $data = []): RouteHelper
-    {
-        return self::addRoute('GET', $uri, null, $data);
-    }
+    /** @var string Application base path (for subfolder hosting) */
+    protected static string $basePath = '';
+
+    /** @var array<string,string> Cached regex patterns */
+    protected static array $regexCache = [];
+
+    /** @var array<string, string> */
+    protected static array $namedRoutes = [];
+
+    // --------------------------------------------------
+    // Route Registration
+    // --------------------------------------------------
 
     public static function get(string $uri, $handler, array $data = []): RouteHelper
     {
@@ -34,56 +47,80 @@ class Route
         return self::addRoute('POST', $uri, $handler, $data);
     }
 
+    public static function put(string $uri, $handler, array $data = []): RouteHelper
+    {
+        return self::addRoute('PUT', $uri, $handler, $data);
+    }
+
+    public static function delete(string $uri, $handler, array $data = []): RouteHelper
+    {
+        return self::addRoute('DELETE', $uri, $handler, $data);
+    }
+
     public static function match(array $methods, string $uri, $handler, array $data = []): RouteHelper
     {
-        $routeHelper = null;
+        $helper = null;
         foreach ($methods as $method) {
-            $routeHelper = self::addRoute(strtoupper($method), $uri, $handler, $data);
+            $helper = self::addRoute(strtoupper($method), $uri, $handler, $data);
         }
-        return $routeHelper;
+        return $helper;
     }
 
     protected static function addRoute(string $method, string $uri, $handler, array $data = []): RouteHelper
     {
         $uri = self::normalizeUri($uri);
 
-        $route = [
+        self::$routes[$method][] = [
             'uri'     => $uri,
             'handler' => $handler,
             'data'    => $data,
         ];
 
-        self::$routes[$method][] = $route;
-
-        // Automatically attach middleware from group
+        // Apply group middleware automatically
         if (! empty(self::$groupMiddleware)) {
             self::attachMiddleware($method, $uri, self::$groupMiddleware);
         }
 
-        return new RouteHelper($method, $uri, $handler);
+        return new RouteHelper($method, $uri, $handler, $data);
     }
 
-    // ----------------------------------------
+    public static function addNamedRoute(string $name, string $uri): void
+    {
+        self::$namedRoutes[$name] = $uri;
+    }
+
+    /**
+     * Get a named route's URI path.
+     *
+     * @param string $name
+     * @return string|null
+     */
+    public static function view(string $name): ?string
+    {
+        return self::$namedRoutes[$name] ?? null;
+    }
+
+    // --------------------------------------------------
     // Grouping
-    // ----------------------------------------
+    // --------------------------------------------------
 
     public static function group(string $prefix, array $middleware, callable $callback): void
     {
-        $prevPrefix     = self::$groupPrefix;
-        $prevMiddleware = self::$groupMiddleware;
+        $previousPrefix     = self::$groupPrefix;
+        $previousMiddleware = self::$groupMiddleware;
 
-        self::$groupPrefix     = trim($prevPrefix . '/' . trim($prefix, '/'), '/');
-        self::$groupMiddleware = array_merge($prevMiddleware, $middleware);
+        self::$groupPrefix     = trim($previousPrefix . '/' . trim($prefix, '/'), '/');
+        self::$groupMiddleware = array_merge($previousMiddleware, $middleware);
 
         $callback();
 
-        self::$groupPrefix     = $prevPrefix;
-        self::$groupMiddleware = $prevMiddleware;
+        self::$groupPrefix     = $previousPrefix;
+        self::$groupMiddleware = $previousMiddleware;
     }
 
-    // ----------------------------------------
+    // --------------------------------------------------
     // Middleware
-    // ----------------------------------------
+    // --------------------------------------------------
 
     public static function registerMiddleware(string $name, $handler): void
     {
@@ -92,234 +129,173 @@ class Route
 
     public static function attachMiddleware(string $method, string $uri, array $middleware): void
     {
-        $key                         = "$method:$uri";
-        self::$routeMiddleware[$key] = $middleware;
+        self::$routeMiddleware["$method:$uri"] = $middleware;
     }
 
-    // ----------------------------------------
-    // Dispatch / Resolve
-    // ----------------------------------------
+    // --------------------------------------------------
+    // Dispatch
+    // --------------------------------------------------
 
-    public static function dispatch(): void
+    public static function dispatch(?string $method = null, ?string $uri = null): void
     {
-        $method = $_SERVER['REQUEST_METHOD'];
-        $uri    = rtrim(parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH), '/') ?: '/';
+        $method = $method ?? ($_SERVER['REQUEST_METHOD'] ?? 'GET');
+        $uri    = self::normalizeRequestUri($uri ?? ($_SERVER['REQUEST_URI'] ?? '/'));
 
         $routes = self::$routes[$method] ?? [];
 
         foreach ($routes as $route) {
-            $pattern = self::buildRegex($route['uri']);
+            $pattern = self::getRegexPattern($route['uri']);
 
             if (preg_match($pattern, $uri, $matches)) {
-                array_shift($matches); // remove full match
+                array_shift($matches);
                 $params = self::extractParams($route['uri'], $matches);
 
-                // Middleware Check
+                // Run middlewares
                 $routeKey    = "$method:{$route['uri']}";
                 $middlewares = self::$routeMiddleware[$routeKey] ?? [];
 
                 foreach ($middlewares as $mw) {
-                    if (! isset(self::$middlewareRegistry[$mw])) {
+                    $handler = self::$middlewareRegistry[$mw] ?? null;
+                    if (! $handler) {
                         continue;
                     }
 
-                    $handler = self::$middlewareRegistry[$mw];
+                    $callable = self::resolveCallable($handler);
+                    $result   = call_user_func($callable);
 
-                    // Handle "Controller@method" string
-                    if (is_string($handler) && str_contains($handler, '@')) {
-                        [$class, $method] = explode('@', $handler);
-                        $class            = 'App\\Controllers\\' . $class;
-                        $handler          = [new $class, $method];
-                    }
-
-                    // Handle [Class::class, 'method']
-                    if (is_array($handler) && is_string($handler[0]) && class_exists($handler[0])) {
-                        $handler = [new $handler[0], $handler[1]];
-                    }
-
-                    if (is_callable($handler)) {
-                        $result = call_user_func($handler);
-                        if ($result === false) {
-                            return;
-                        }
-
+                    if ($result === false) {
+                        return; // Middleware blocked execution
                     }
                 }
 
-                // Route handler execution
-                self::handleRoute($route['handler'], $params, $route['data'] ?? []);
+                self::handleRoute($route['handler'], $params, $route['data']);
                 return;
             }
         }
 
-        // Not Found
         self::handleNotFound();
     }
 
-    // ----------------------------------------
+    // --------------------------------------------------
     // Utilities
-    // ----------------------------------------
+    // --------------------------------------------------
 
     protected static function normalizeUri(string $uri): string
     {
-        $uri = rtrim($uri, '/') ?: '/';
+        $uri = '/' . trim($uri, '/');
         if (self::$groupPrefix) {
-            $uri = '/' . trim(self::$groupPrefix . '/' . ltrim($uri, '/'), '/');
+            $uri = '/' . trim(self::$groupPrefix . $uri, '/');
         }
-        return $uri;
+        return $uri ?: '/';
     }
 
-    protected static function buildRegex(string $uri): string
+    protected static function normalizeRequestUri(string $uri): string
     {
-        $pattern = preg_replace('#\{([^}]+)\}#', '([^/]+)', $uri);
-        return "#^" . rtrim($pattern, '/') . "/?$#";
+        $path = parse_url($uri, PHP_URL_PATH) ?? '/';
+        $path = '/' . trim($path, '/');
+
+        if (self::$basePath && str_starts_with($path, self::$basePath)) {
+            $path = substr($path, strlen(self::$basePath));
+        }
+
+        return $path ?: '/';
+    }
+
+    protected static function getRegexPattern(string $uri): string
+    {
+        if (isset(self::$regexCache[$uri])) {
+            return self::$regexCache[$uri];
+        }
+
+        $pattern                       = preg_replace('#\{([^}]+)\}#', '([^/]+)', $uri);
+        return self::$regexCache[$uri] = "#^" . rtrim($pattern, '/') . "/?$#";
     }
 
     protected static function extractParams(string $uri, array $matches): array
     {
         $params = [];
         if (preg_match_all('#\{([^}]+)\}#', $uri, $paramNames)) {
-            foreach ($paramNames[1] as $index => $name) {
-                $params[$name] = $matches[$index] ?? null;
+            foreach ($paramNames[1] as $i => $name) {
+                $params[$name] = $matches[$i] ?? null;
             }
         }
         return $params;
     }
 
-    protected static function handleRoute($handler, array $params, array $data = []): void
+    protected static function resolveCallable($handler)
     {
         if (is_string($handler) && str_contains($handler, '@')) {
             [$class, $method] = explode('@', $handler);
-            $class            = 'App\\Controllers\\' . $class;
-        } elseif (is_array($handler) && count($handler) === 2) {
-            [$class, $method] = $handler;
-        }
-
-        if (isset($class)) {
             if (! class_exists($class)) {
-                throw new Exception("Class $class not found");
+                throw new Exception("Handler class '$class' not found.");
             }
-
-            $instance = new $class;
-            if (! method_exists($instance, $method)) {
-                throw new Exception("Method $method not found in $class");
-            }
-
-            call_user_func_array([$instance, $method], $params);
-        } elseif (is_callable($handler)) {
-            echo call_user_func_array($handler, $params);
-        } elseif (is_string($handler)) {
-            View::render($handler, $data);
+            return [new $class, $method];
         }
+
+        if (is_array($handler) && isset($handler[0], $handler[1]) && class_exists($handler[0])) {
+            return [new $handler[0], $handler[1]];
+        }
+
+        return $handler;
+    }
+
+    protected static function handleRoute($handler, array $params, array $data = []): void
+    {
+        $callable = self::resolveCallable($handler);
+
+        if (is_callable($callable)) {
+            echo call_user_func_array($callable, $params);
+            return;
+        }
+
+        throw new Exception("Invalid route handler for route.");
     }
 
     protected static function handleNotFound(): void
     {
-        if (self::$notFound) {
+        http_response_code(404);
+        if (is_callable(self::$notFound)) {
             call_user_func(self::$notFound);
         } else {
-            exit('View not found!');
+            echo '<h1>404 Not Found</h1>';
         }
     }
 
-    // ----------------------------------------
-    // Misc
-    // ----------------------------------------
+    // --------------------------------------------------
+    // Helpers
+    // --------------------------------------------------
 
     public static function notFound(callable $callback): void
     {
         self::$notFound = $callback;
     }
 
-    public static function redirect(string $path): void
+    public static function redirect(string $url, int $code = 302): void
     {
-        header("Location: $path");
+        header("Location: $url", true, $code);
         exit;
     }
 
-    public static function view(string $name): string
+    public static function setBasePath(string $basePath): void
     {
-        return self::$namedRoutes[$name] ?? '#';
+        self::$basePath = '/' . trim($basePath, '/');
     }
 
-    public static function assets(string $path, bool $return = false)
+    public static function segments(): array
     {
-        $path = './public/assets/' . ltrim($path, '/');
-
-        if (! $return) {
-            echo $path;
-            return;
-        }
-
-        return $path;
+        $uri = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
+        return array_values(array_filter(explode('/', trim($uri, '/'))));
     }
 
-    public static function path(string $path, bool $relative = true): string
+    public static function segment(int $index): ?string
     {
-        $path = '/' . ltrim($path, '/');
-
-        if ($relative) {
-            return $path;
-        }
-
-        $root = $_SERVER['DOCUMENT_ROOT'] ?? dirname(__DIR__, 2);
-        $root = rtrim($root, '/');
-
-        return $root . $path;
+        $segments = self::segments();
+        return $segments[$index - 1] ?? null;
     }
 
-    /**
-     * Get all URL path segments as an array.
-     *
-     * @param bool $reverse Whether to reverse the segment order.
-     * @param bool $numericIndex Whether to use numeric keys.
-     * @return array
-     */
-    public static function segments(bool $reverse = false, bool $numericIndex = true): array
-    {
-        $uri = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
-
-        // Remove leading/trailing slashes and explode
-        $segments = array_filter(explode('/', trim($uri, '/')));
-
-        if ($reverse) {
-            $segments = array_reverse($segments);
-        }
-
-        return $numericIndex ? array_values($segments) : $segments;
-    }
-
-    /**
-     * Get a specific segment by level.
-     *
-     * @param int $level 1-based level (from start or end depending on $reverse).
-     * @param bool $fromEnd Whether to count from the end (like reverse).
-     * @return string|null
-     */
-    public static function segment(int $level, bool $fromEnd = false): ?string
-    {
-        $segments = self::segments($reverse = $fromEnd);
-        return $segments[$level - 1] ?? null;
-    }
-
-    /**
-     * Get the full root path from the URI.
-     *
-     * @return string
-     */
-    public static function root(): string
-    {
-        return parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH) ?? '/';
-    }
-
-    /**
-     * Get full URL with scheme, host, and request URI.
-     *
-     * @return string
-     */
     public static function fullUrl(): string
     {
-        $scheme = isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off' ? 'https' : 'http';
+        $scheme = (! empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
         $host   = $_SERVER['HTTP_HOST'] ?? 'localhost';
         $uri    = $_SERVER['REQUEST_URI'] ?? '/';
         return "$scheme://$host$uri";
