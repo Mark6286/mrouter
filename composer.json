@@ -1,0 +1,20 @@
+{
+  "name": "reymark/route",
+  "description": "A lightweight and flexible PHP routing library for building clean and maintainable web applications.",
+  "type": "library",
+  "license": "MIT",
+  "autoload": {
+    "psr-4": {
+      "Route\\": "src/"
+    }
+  },
+  "authors": [
+    {
+      "name": "Reymark Balaod",
+      "email": "reymarkbalaod@gmail.com"
+    }
+  ],
+  "require": {
+    "php": ">=7.4"
+  }
+}
